@@ -1,0 +1,75 @@
+{
+  "build": [
+    ["sh", "-c", "mkdir -p .fleet/build && cc -Ofast -march=native -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes .fleet/bench_gpt2.c -lm -o .fleet/build/bench_gpt2"]
+  ],
+  "tests": [
+    [".fleet/build/bench_gpt2", "check"]
+  ],
+  "workload": {
+    "argv": [".fleet/build/bench_gpt2", "bench", "2", "32", "64", "4", "2", "512", "512", "5"],
+    "timeout_s": 120,
+    "compare_stderr": false,
+    "correctness": "output"
+  },
+  "artifact": ".fleet/build/bench_gpt2",
+  "build_outputs": [".fleet/build"],
+  "harness_files": [".fleet/bench_gpt2.c"],
+  "entry_points": [
+    {
+      "id": "synthetic-gpt2-train",
+      "description": "Deterministic synthetic GPT-2 CPU forward/backward training slice, representative of train_gpt2.c C reference kernels without pretrained weights.",
+      "artifact": ".fleet/build/bench_gpt2",
+      "workload": {
+        "argv": [".fleet/build/bench_gpt2", "bench", "2", "32", "64", "4", "2", "512", "512", "5"],
+        "timeout_s": 120,
+        "compare_stderr": false,
+        "correctness": "output"
+      },
+      "tests": [[".fleet/build/bench_gpt2", "check"]],
+      "compile_outputs": [".fleet/build/bench_gpt2"],
+      "source_paths": ["train_gpt2.c"],
+      "functions": ["gpt2_forward", "gpt2_backward", "attention_backward", "matmul_forward", "matmul_backward", "layernorm_forward", "layernorm_backward", "gelu_forward", "gelu_backward"],
+      "inputs": "Training workload: B=2, T=32, C=64, NH=4, L=2, V=512, Vp=512, 5 repeated forward/backward passes; deterministic xorshift synthetic parameters and token ids.",
+      "setup": "Harness constructs model parameters and token batches deterministically in memory; no checkpoint or dataset download is required.",
+      "limitations": "Standalone synthetic CPU slice; it excludes file I/O, tokenizer/dataloader, AdamW update, and real pretrained weights. It is intended to exercise forward/backward kernels in train_gpt2.c."
+    },
+    {
+      "id": "holdout-long-context",
+      "description": "Held-out deterministic synthetic CPU forward/backward slice with longer sequence length and one layer.",
+      "artifact": ".fleet/build/bench_gpt2",
+      "workload": {
+        "argv": [".fleet/build/bench_gpt2", "bench", "1", "40", "64", "4", "1", "384", "384", "4"],
+        "timeout_s": 120,
+        "compare_stderr": false,
+        "correctness": "output"
+      },
+      "tests": [[".fleet/build/bench_gpt2", "check"]],
+      "compile_outputs": [".fleet/build/bench_gpt2"],
+      "source_paths": ["train_gpt2.c"],
+      "functions": ["gpt2_forward", "gpt2_backward", "attention_backward"],
+      "inputs": "Held-out validation: B=1, T=40, C=64, NH=4, L=1, V=384, Vp=384, 4 repeated forward/backward passes; not used as the default search workload.",
+      "setup": "Harness constructs model parameters and token batches deterministically in memory.",
+      "limitations": "Synthetic validation slice; no file I/O, update step, or pretrained weights."
+    },
+    {
+      "id": "holdout-wide-channels",
+      "description": "Held-out deterministic synthetic CPU forward/backward slice with wider channels and different head count.",
+      "artifact": ".fleet/build/bench_gpt2",
+      "workload": {
+        "argv": [".fleet/build/bench_gpt2", "bench", "1", "24", "96", "6", "2", "512", "512", "3"],
+        "timeout_s": 120,
+        "compare_stderr": false,
+        "correctness": "output"
+      },
+      "tests": [[".fleet/build/bench_gpt2", "check"]],
+      "compile_outputs": [".fleet/build/bench_gpt2"],
+      "source_paths": ["train_gpt2.c"],
+      "functions": ["gpt2_forward", "gpt2_backward", "attention_backward", "matmul_backward"],
+      "inputs": "Held-out validation: B=1, T=24, C=96, NH=6, L=2, V=512, Vp=512, 3 repeated forward/backward passes; not used as the default search workload.",
+      "setup": "Harness constructs model parameters and token batches deterministically in memory.",
+      "limitations": "Synthetic validation slice; no file I/O, update step, or pretrained weights."
+    }
+  ],
+  "default_entry_point": "synthetic-gpt2-train",
+  "description": "CPU-only synthetic GPT-2 forward/backward benchmark for train_gpt2.c reference kernels. Uses deterministic generated inputs to avoid pretrained-weight downloads and includes separate held-out entry points with different shapes."
+}

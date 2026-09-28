@@ -203,27 +203,42 @@ void matmul_forward(float* out,
     #pragma omp parallel for
     for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
         for (int o = 0; o < OC; o++) {
-            // we'll keep LOOP_UNROLL many results in registers
-            float result[LOOP_UNROLL];
-            // initialize the bias, if it exists
-            for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
-                result[ibt] = (bias != NULL) ? bias[o] : 0.0f;
-            }
+            // we'll keep LOOP_UNROLL many results in registers. Spell the
+            // unroll explicitly; these fixed-size rows are the hot path for the
+            // benchmark and this avoids small array indexing in the innermost loop.
+            float bval = (bias != NULL) ? bias[o] : 0.0f;
+            float result0 = bval;
+            float result1 = bval;
+            float result2 = bval;
+            float result3 = bval;
+            float result4 = bval;
+            float result5 = bval;
+            float result6 = bval;
+            float result7 = bval;
             // inner loops. Because we do LOOP_UNROLL steps of inner bt, we can cache
             // the value of weight[i + o * C] and reuse it.
             // we compile with -Ofast, so the compiler will turn the inner loop into FMAs
             for (int i = 0; i < C; i++) {
                 float w = weight[i + o * C];
-                for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
-                    int bt = obt + ibt;
-                    result[ibt] += inp[bt * C + i] * w;
-                }
+                const float* inp_i = inp + obt * C + i;
+                result0 += inp_i[0 * C] * w;
+                result1 += inp_i[1 * C] * w;
+                result2 += inp_i[2 * C] * w;
+                result3 += inp_i[3 * C] * w;
+                result4 += inp_i[4 * C] * w;
+                result5 += inp_i[5 * C] * w;
+                result6 += inp_i[6 * C] * w;
+                result7 += inp_i[7 * C] * w;
             }
             // write back results to main memory
-            for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
-                int bt = obt + ibt;
-                out[bt * OC + o] = result[ibt];
-            }
+            out[(obt + 0) * OC + o] = result0;
+            out[(obt + 1) * OC + o] = result1;
+            out[(obt + 2) * OC + o] = result2;
+            out[(obt + 3) * OC + o] = result3;
+            out[(obt + 4) * OC + o] = result4;
+            out[(obt + 5) * OC + o] = result5;
+            out[(obt + 6) * OC + o] = result6;
+            out[(obt + 7) * OC + o] = result7;
         }
     }
 }
@@ -253,11 +268,11 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // backward into weight/bias, parallelize over output channels OC
     #pragma omp parallel for
     for (int o = 0; o < OC; o++) {
+        float* dwrow = dweight + o*C;
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
                 const float* dout_bt = dout + b * T * OC + t * OC;
                 const float* inp_bt = inp + b * T * C + t * C;
-                float* dwrow = dweight + o*C;
                 float d = dout_bt[o];
                 if (dbias != NULL) { dbias[o] += d; }
                 for (int i = 0; i < C; i++) {
@@ -366,37 +381,45 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
                 // backward pass 4, through the value accumulation
                 float* dout_bth = dout + b * T * C + t * C + h * hs;
                 for (int t2 = 0; t2 <= t; t2++) {
+                    float att_btht2 = att_bth[t2];
+                    float datt_acc = datt_bth[t2];
                     float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
                     float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
                     for (int i = 0; i < hs; i++) {
                         // in the forward pass this was:
                         // out_bth[i] += att_bth[t2] * value_t2[i];
                         // so now we have:
-                        datt_bth[t2] += value_t2[i] * dout_bth[i];
-                        dvalue_t2[i] += att_bth[t2] * dout_bth[i];
+                        float d = dout_bth[i];
+                        datt_acc += value_t2[i] * d;
+                        dvalue_t2[i] += att_btht2 * d;
                     }
+                    datt_bth[t2] = datt_acc;
                 }
 
                 // backward pass 2 & 3, the softmax
                 // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+                // The softmax Jacobian-vector product simplifies from the explicit O(t^2)
+                // double loop to att_i * (datt_i - sum_j att_j * datt_j). This is the
+                // same derivative, just accumulated in linear time over the causal prefix.
+                float d_att_dot = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    for (int t3 = 0; t3 <= t; t3++) {
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
-                    }
+                    d_att_dot += att_bth[t2] * datt_bth[t2];
+                }
+                for (int t2 = 0; t2 <= t; t2++) {
+                    dpreatt_bth[t2] += att_bth[t2] * (datt_bth[t2] - d_att_dot);
                 }
 
                 // backward pass 1, the query @ key matmul
                 for (int t2 = 0; t2 <= t; t2++) {
                     float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
                     float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float dpre = dpreatt_bth[t2] * scale;
                     for (int i = 0; i < hs; i++) {
                         // in the forward pass this was:
                         // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
                         // so now we have:
-                        dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
-                        dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
+                        dquery_t[i] += key_t2[i] * dpre;
+                        dkey_t2[i] += query_t[i] * dpre;
                     }
                 }
             }
